@@ -104,14 +104,6 @@ func (this *GeneratorVisitor) VisitWalk(iface *Interface) error {
 
 	gen := NewGenerator(iface)
 
-	if this.InPackage {
-		gen.GenerateIPPrologue()
-	} else {
-		gen.GeneratePrologue(pkg)
-	}
-
-	gen.GeneratePrologueNote(this.Note)
-
 	err = gen.Generate()
 	if err != nil {
 		return err

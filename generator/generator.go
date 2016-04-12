@@ -3,18 +3,58 @@ package generator
 import (
 	"bytes"
 	"fmt"
-	"go/ast"
 	"go/types"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
-	"unicode"
 
 	"golang.org/x/tools/imports"
+	"text/template"
 
 	"errors"
 )
+
+const MockstockRaw = `package {{ .PackageName }}{{ $Interface := .InterfaceName }}
+
+import (
+	"github.com/urbint/mockstock/mock"
+{{ range $i, $import := .Imports -}}
+	"{{$import}}"
+{{- end -}}
+)
+
+type Mock{{ $Interface }} {
+	mock.Mock
+}
+
+{{ range $i, $fn := .Functions -}}
+func (m *Mock{{ $Interface }}) {{ $fn.Name }}({{$fn.ArgsDef}}){{$fn.ReturnDef}} {
+{{- if $fn.HasArgs }}
+	ret := m.traceCall(m.{{$fn.Name}},{{ $fn.ArgExpansion }})
+{{ else }}
+	ret := m.traceCall(m.{{$fn.Name}})
+{{ end }}
+
+{{- range $i, $ret := $fn.Rets }}
+	var {{ $ret.VarName }} {{ $ret.Type }}
+	if rf, ok := ret.Get({{$ret.Index}}).(func() {{ $ret.Type }}); ok {
+		{{ $ret.VarName }} = rf()
+	} else {
+		{{ $ret.VarName }} = ret.Get({{$ret.Index}})
+	}
+{{ end }}
+	return {{ $fn.ReturnString }}
+}
+{{- end -}}`
+
+var mockTmpl *template.Template
+
+func init() {
+	tmpl, err := template.New("mockstock-template").Parse(MockstockRaw)
+	if err != nil {
+		panic(err.Error())
+	}
+	mockTmpl = tmpl
+}
 
 type Generator struct {
 	buf bytes.Buffer
@@ -23,89 +63,179 @@ type Generator struct {
 	iface *Interface
 }
 
+type TemplateVars struct {
+	PackageName   string
+	Imports       []string
+	InterfaceName string
+	Functions     []TemplateFn
+}
+
+type TemplateFn struct {
+	Name         string
+	HasArgs      bool
+	ArgsDef      string
+	ArgExpansion string
+	ReturnDef    string
+	ReturnString string
+	Rets         []TemplateRet
+}
+
+type TemplateRet struct {
+	Index   int
+	VarName string
+	Type    string
+}
+
 func NewGenerator(iface *Interface) *Generator {
 	return &Generator{
 		iface: iface,
 	}
 }
 
-func (g *Generator) GenerateIPPrologue() {
-	g.ip = true
+func (g *Generator) BuildTemplateVars() (TemplateVars, error) {
+	templateFns := make([]TemplateFn, g.iface.Type.NumMethods())
+	for i := 0; i < g.iface.Type.NumMethods(); i++ {
 
-	g.printf("package %s\n\n", g.iface.File.Name)
+		fn := g.iface.Type.Method(i)
 
-	g.printf("import \"github.com/stretchr/testify/mock\"\n\n")
-	if g.iface.File.Imports == nil {
-		return
-	}
+		ftype := fn.Type().(*types.Signature)
+		// fname := fn.Name()
 
-	for _, imp := range g.iface.File.Imports {
-		if imp.Name == nil {
-			g.printf("import %s\n", imp.Path.Value)
-		} else {
-			g.printf("import %s %s\n", imp.Name.Name, imp.Path.Value)
+		params := genList(ftype.Params(), ftype.Variadic())
+		returns := genList(ftype.Results(), false)
+
+		argExpansion := ""
+		if len(params.Names) > 0 {
+			argExpansion = fmt.Sprintf(" %s", strings.Join(params.Names, ", "))
 		}
+
+		templateFn := TemplateFn{
+			Name:         fn.Name(),
+			HasArgs:      len(params.Types) > 0,
+			ArgsDef:      strings.Join(params.Params, ", "),
+			ArgExpansion: argExpansion,
+		}
+
+		switch len(returns.Types) {
+		case 0:
+			templateFn.ReturnDef = ""
+		case 1:
+			templateFn.ReturnDef = fmt.Sprintf(" %s", returns.Types[0])
+		default:
+			templateFn.ReturnDef = fmt.Sprintf(" (%s)", strings.Join(returns.Types, ", "))
+		}
+
+		var returnVars []string
+		for i, retType := range returns.Types {
+			varName := fmt.Sprintf("r%d", i)
+			templateFn.Rets = append(templateFn.Rets, TemplateRet{
+				Index:   i,
+				VarName: varName,
+				Type:    retType,
+			})
+			returnVars = append(returnVars, varName)
+		}
+		templateFn.ReturnString = strings.Join(returnVars, ", ")
+
+		templateFns[i] = templateFn
 	}
 
-	g.printf("\n")
+	return TemplateVars{
+		PackageName:   "mock",
+		InterfaceName: g.iface.Name,
+		Functions:     templateFns,
+	}, nil
 }
 
-func (g *Generator) mockName() string {
-	if g.ip {
-		if ast.IsExported(g.iface.Name) {
-			return "Mock" + g.iface.Name
-		} else {
-			first := true
-			return "mock" + strings.Map(func(r rune) rune {
-				if first {
-					first = false
-					return unicode.ToUpper(r)
-				}
-				return r
-			}, g.iface.Name)
-		}
-	}
-
-	return g.iface.Name
-}
-
-func (g *Generator) GeneratePrologue(pkg string) {
-	g.printf("package %v\n\n", pkg)
-
-	goPath := os.Getenv("GOPATH")
-
-	local, err := filepath.Rel(filepath.Join(goPath, "src"), filepath.Dir(g.iface.Path))
+func (g *Generator) Generate() error {
+	vars, err := g.BuildTemplateVars()
 	if err != nil {
-		panic("unable to figure out path for package")
+		return err
 	}
 
-	g.printf("import \"%s\"\n", local)
-
-	g.printf("import \"github.com/stretchr/testify/mock\"\n\n")
-	if g.iface.File.Imports == nil {
-		return
+	if err = mockTmpl.Execute(&g.buf, vars); err != nil {
+		return err
 	}
-
-	for _, imp := range g.iface.File.Imports {
-		if imp.Name == nil {
-			g.printf("import %s\n", imp.Path.Value)
-		} else {
-			g.printf("import %s %s\n", imp.Name.Name, imp.Path.Value)
-		}
-	}
-
-	g.printf("\n")
+	return nil
 }
 
-func (g *Generator) GeneratePrologueNote(note string) {
-	if note != "" {
-		g.printf("\n")
-		for _, n := range strings.Split(note, "\\n") {
-			g.printf("// %s\n", n)
-		}
-		g.printf("\n")
-	}
-}
+// func (g *Generator) GenerateIPPrologue() {
+// 	g.ip = true
+
+// 	g.printf("package %s\n\n", g.iface.File.Name)
+
+// 	g.printf("import \"github.com/urbint/mockstock/mock\"\n\n")
+// 	if g.iface.File.Imports == nil {
+// 		return
+// 	}
+
+// 	for _, imp := range g.iface.File.Imports {
+// 		if imp.Name == nil {
+// 			g.printf("import %s\n", imp.Path.Value)
+// 		} else {
+// 			g.printf("import %s %s\n", imp.Name.Name, imp.Path.Value)
+// 		}
+// 	}
+
+// 	g.printf("\n")
+// }
+
+// func (g *Generator) mockName() string {
+// 	if g.ip {
+// 		if ast.IsExported(g.iface.Name) {
+// 			return "Mock" + g.iface.Name
+// 		} else {
+// 			first := true
+// 			return "mock" + strings.Map(func(r rune) rune {
+// 				if first {
+// 					first = false
+// 					return unicode.ToUpper(r)
+// 				}
+// 				return r
+// 			}, g.iface.Name)
+// 		}
+// 	}
+
+// 	return g.iface.Name
+// }
+
+// func (g *Generator) GeneratePrologue(pkg string) {
+// 	g.printf("package %v\n\n", pkg)
+
+// 	goPath := os.Getenv("GOPATH")
+
+// 	local, err := filepath.Rel(filepath.Join(goPath, "src"), filepath.Dir(g.iface.Path))
+// 	if err != nil {
+// 		panic("unable to figure out path for package")
+// 	}
+
+// 	g.printf("import \"%s\"\n", local)
+
+// 	g.printf("import \"github.com/urbint/mockstock/mock\"\n\n")
+// 	if g.iface.File.Imports == nil {
+// 		return
+// 	}
+
+// 	for _, imp := range g.iface.File.Imports {
+// 		if imp.Name == nil {
+// 			g.printf("import %s\n", imp.Path.Value)
+// 		} else {
+// 			g.printf("import %s %s\n", imp.Name.Name, imp.Path.Value)
+// 		}
+// 	}
+
+// 	g.printf("\n")
+// }
+
+// func (g *Generator) GeneratePrologueNote(note string) {
+// 	if note != "" {
+// 		g.printf("\n")
+// 		for _, n := range strings.Split(note, "\\n") {
+// 			g.printf("// %s\n", n)
+// 		}
+// 		g.printf("\n")
+// 	}
+// }
 
 var ErrNotInterface = errors.New("expression not an interface")
 
@@ -291,89 +421,89 @@ func genList(list *types.Tuple, varadic bool) *paramList {
 
 var ErrNotSetup = errors.New("not setup")
 
-func (g *Generator) Generate() error {
-	if g.iface == nil {
-		return ErrNotSetup
-	}
+// func (g *Generator) Generate() error {
+// 	if g.iface == nil {
+// 		return ErrNotSetup
+// 	}
 
-	g.printf("// This is an autogenerated mock type for the %s type\n", g.iface.Name)
-	g.printf("type %s struct {\n\tmock.Mock\n}\n\n", g.mockName())
+// 	g.printf("// This is an autogenerated mock type for the %s type\n", g.iface.Name)
+// 	g.printf("type %s struct {\n\tmock.Mock\n}\n\n", g.mockName())
 
-	for i := 0; i < g.iface.Type.NumMethods(); i++ {
-		fn := g.iface.Type.Method(i)
+// 	for i := 0; i < g.iface.Type.NumMethods(); i++ {
+// 		fn := g.iface.Type.Method(i)
 
-		ftype := fn.Type().(*types.Signature)
-		fname := fn.Name()
+// 		ftype := fn.Type().(*types.Signature)
+// 		fname := fn.Name()
 
-		params := genList(ftype.Params(), ftype.Variadic())
-		returns := genList(ftype.Results(), false)
+// 		params := genList(ftype.Params(), ftype.Variadic())
+// 		returns := genList(ftype.Results(), false)
 
-		g.printf("// %s provides a mock function with given fields: %s\n", fname, strings.Join(params.Names, ", "))
-		g.printf("func (_m *%s) %s(%s) ", g.mockName(), fname, strings.Join(params.Params, ", "))
+// 		g.printf("// %s provides a mock function with given fields: %s\n", fname, strings.Join(params.Names, ", "))
+// 		g.printf("func (_m *%s) %s(%s) ", g.mockName(), fname, strings.Join(params.Params, ", "))
 
-		switch len(returns.Types) {
-		case 0:
-			g.printf("{\n")
-		case 1:
-			g.printf("%s {\n", returns.Types[0])
-		default:
-			g.printf("(%s) {\n", strings.Join(returns.Types, ", "))
-		}
+// 		switch len(returns.Types) {
+// 		case 0:
+// 			g.printf("{\n")
+// 		case 1:
+// 			g.printf("%s {\n", returns.Types[0])
+// 		default:
+// 			g.printf("(%s) {\n", strings.Join(returns.Types, ", "))
+// 		}
 
-		formatParamNames := func() string {
-			names := ""
-			for i, name := range params.Names {
-				if i > 0 {
-					names += ", "
-				}
+// 		formatParamNames := func() string {
+// 			names := ""
+// 			for i, name := range params.Names {
+// 				if i > 0 {
+// 					names += ", "
+// 				}
 
-				paramType := params.Types[i]
-				// for variable args, move the ... to the end.
-				if strings.Index(paramType, "...") == 0 {
-					name += "..."
-				}
-				names += name
-			}
-			return names
-		}
+// 				paramType := params.Types[i]
+// 				// for variable args, move the ... to the end.
+// 				if strings.Index(paramType, "...") == 0 {
+// 					name += "..."
+// 				}
+// 				names += name
+// 			}
+// 			return names
+// 		}
 
-		if len(returns.Types) > 0 {
-			g.printf("\tret := _m.Called(%s)\n\n", strings.Join(params.Names, ", "))
+// 		if len(returns.Types) > 0 {
+// 			g.printf("\tret := _m.Called(%s)\n\n", strings.Join(params.Names, ", "))
 
-			var (
-				ret []string
-			)
+// 			var (
+// 				ret []string
+// 			)
 
-			for idx, typ := range returns.Types {
-				g.printf("\tvar r%d %s\n", idx, typ)
-				g.printf("\tif rf, ok := ret.Get(%d).(func(%s) %s); ok {\n",
-					idx, strings.Join(params.Types, ", "), typ)
-				g.printf("\t\tr%d = rf(%s)\n", idx, formatParamNames())
-				g.printf("\t} else {\n")
-				if typ == "error" {
-					g.printf("\t\tr%d = ret.Error(%d)\n", idx, idx)
-				} else if returns.Nilable[idx] {
-					g.printf("\t\tif ret.Get(%d) != nil {\n", idx)
-					g.printf("\t\t\tr%d = ret.Get(%d).(%s)\n", idx, idx, typ)
-					g.printf("\t\t}\n")
-				} else {
-					g.printf("\t\tr%d = ret.Get(%d).(%s)\n", idx, idx, typ)
-				}
-				g.printf("\t}\n\n")
+// 			for idx, typ := range returns.Types {
+// 				g.printf("\tvar r%d %s\n", idx, typ)
+// 				g.printf("\tif rf, ok := ret.Get(%d).(func(%s) %s); ok {\n",
+// 					idx, strings.Join(params.Types, ", "), typ)
+// 				g.printf("\t\tr%d = rf(%s)\n", idx, formatParamNames())
+// 				g.printf("\t} else {\n")
+// 				if typ == "error" {
+// 					g.printf("\t\tr%d = ret.Error(%d)\n", idx, idx)
+// 				} else if returns.Nilable[idx] {
+// 					g.printf("\t\tif ret.Get(%d) != nil {\n", idx)
+// 					g.printf("\t\t\tr%d = ret.Get(%d).(%s)\n", idx, idx, typ)
+// 					g.printf("\t\t}\n")
+// 				} else {
+// 					g.printf("\t\tr%d = ret.Get(%d).(%s)\n", idx, idx, typ)
+// 				}
+// 				g.printf("\t}\n\n")
 
-				ret = append(ret, fmt.Sprintf("r%d", idx))
-			}
+// 				ret = append(ret, fmt.Sprintf("r%d", idx))
+// 			}
 
-			g.printf("\treturn %s\n", strings.Join(ret, ", "))
-		} else {
-			g.printf("\t_m.Called(%s)\n", strings.Join(params.Names, ", "))
-		}
+// 			g.printf("\treturn %s\n", strings.Join(ret, ", "))
+// 		} else {
+// 			g.printf("\t_m.Called(%s)\n", strings.Join(params.Names, ", "))
+// 		}
 
-		g.printf("}\n")
-	}
+// 		g.printf("}\n")
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 func (g *Generator) Write(w io.Writer) error {
 	opt := &imports.Options{Comments: true}
